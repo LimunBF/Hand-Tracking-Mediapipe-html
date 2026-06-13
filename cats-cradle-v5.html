@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cat's Cradle · v5 · Cyan Mesh</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js" crossorigin="anonymous"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#1a1a2e;overflow:hidden;font-family:'Courier New',monospace}
+#vid{position:fixed;top:-9999px;left:-9999px;width:640px;height:480px;opacity:0;pointer-events:none}
+main canvas{display:block;position:fixed;top:0;left:0}
+#status{
+  position:fixed;top:14px;right:18px;z-index:10;
+  color:rgba(0,255,255,.95);font-size:11px;letter-spacing:.1em;text-align:right;line-height:1.7;
+  text-shadow:0 0 8px rgba(0,255,255,.9),0 0 3px rgba(0,0,0,1);
+}
+#counter{
+  position:fixed;top:14px;left:18px;z-index:10;
+  color:#fff;font-size:13px;letter-spacing:.12em;line-height:1.8;
+  text-shadow:0 0 10px rgba(0,255,255,.9),0 0 3px rgba(0,0,0,1);
+  background:rgba(0,0,0,.35);padding:10px 16px;border-radius:8px;
+  border:1px solid rgba(0,255,255,.3);backdrop-filter:blur(4px);
+}
+#counter .num{font-size:34px;color:#FF50DC;text-shadow:0 0 14px rgba(255,80,220,.95),0 0 4px rgba(0,0,0,1);font-weight:bold;min-width:48px;display:inline-block}
+#counter .lbl{font-size:9px;opacity:.75;letter-spacing:.18em}
+.hand-row{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
+#mode-toggle{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:10;
+  display:flex;gap:8px;background:rgba(0,0,0,.45);padding:6px;border-radius:30px;
+  border:1px solid rgba(0,255,255,.3);backdrop-filter:blur(6px);
+}
+.mode-btn{
+  background:transparent;border:none;color:rgba(255,255,255,.55);
+  padding:8px 22px;border-radius:24px;cursor:pointer;
+  font-family:'Courier New',monospace;font-size:11px;font-weight:bold;
+  letter-spacing:.14em;transition:all .2s;user-select:none;
+}
+.mode-btn:hover{color:#fff}
+.mode-btn.active{
+  background:linear-gradient(135deg,#00B4D8,#0077B6);
+  color:#fff;text-shadow:0 0 8px rgba(255,255,255,.6);
+  box-shadow:0 0 16px rgba(0,180,216,.5);
+}
+#hint{
+  position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:5;
+  text-align:center;color:#0ff;font-size:14px;letter-spacing:.1em;
+  line-height:2.4;pointer-events:none;transition:opacity .8s;
+  text-shadow:0 0 12px rgba(0,255,255,.9),0 0 3px rgba(0,0,0,1);
+  background:rgba(0,0,0,.4);padding:20px 30px;border-radius:12px;
+}
+#hint small{font-size:11px;opacity:.85;display:block;margin-top:6px}
+</style>
+</head>
+<body>
+<video id="vid" playsinline autoplay muted></video>
+
+<div id="counter">
+  <div class="hand-row">
+    <span class="lbl">LEFT</span>
+    <span class="num" id="leftCount">—</span>
+    <span class="lbl" id="leftGest"></span>
+  </div>
+  <div class="hand-row">
+    <span class="lbl">RIGHT</span>
+    <span class="num" id="rightCount">—</span>
+    <span class="lbl" id="rightGest"></span>
+  </div>
+  <div class="hand-row" style="margin-top:10px;border-top:1px solid rgba(0,255,255,.3);padding-top:8px">
+    <span class="lbl">TOTAL</span>
+    <span class="num" id="totalCount" style="color:#FFEB3B;text-shadow:0 0 14px rgba(255,235,60,.95),0 0 4px rgba(0,0,0,1)">—</span>
+    <span class="lbl">FINGERS</span>
+  </div>
+</div>
+
+<div id="mode-toggle">
+  <button class="mode-btn active" data-mode="laser" onclick="setMode('laser',this)">⚡ LASER</button>
+  <button class="mode-btn" data-mode="mesh" onclick="setMode('mesh',this)">◈ CYAN MESH</button>
+  <button class="mode-btn" data-mode="both" onclick="setMode('both',this)">✦ BOTH</button>
+</div>
+
+<div id="status">initializing…</div>
+<div id="hint">◇ loading mediapipe ◇<br><small>allow camera access if prompted</small></div>
+
+<script>
+const FINGERTIPS = [4, 8, 12, 16, 20];
+const FINGER_NAMES = ['thumb','index','middle','ring','pinky'];
+const FINGER_PIPS  = [3, 6, 10, 14, 18];
+const ALL_LANDMARKS = 21;
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17]
+];
+
+let hands = [];   // each: { pts:[[x,y],..], z:[z0,z1,..] }
+let modelReady = false;
+let handsEverSeen = false;
+let vidEl;
+let t = 0;
+let particles = [];
+let prevTouchPairs = new Set();
+let mode = 'laser';  // 'laser' | 'mesh' | 'both'
+
+function setMode(m, el) {
+  mode = m;
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+}
+
+function setup() {
+  const cnv = createCanvas(windowWidth, windowHeight);
+  cnv.parent(document.body);
+  pixelDensity(1);
+  frameRate(60);
+  initMediaPipe();
+}
+function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+
+// Store video draw params so mesh mode can reuse them
+let vidDraw = null;
+
+function draw() {
+  t += 0.018;
+  const ctx = drawingContext;
+  ctx.shadowBlur = 0;
+
+  // ── 1. CAMERA BACKGROUND ──
+  vidDraw = null;
+  if (vidEl && vidEl.readyState >= 2 && vidEl.videoWidth > 0) {
+    const vw = vidEl.videoWidth, vh = vidEl.videoHeight;
+    const cR = width / height, vR = vw / vh;
+    let sx, sy, sw, sh;
+    if (vR > cR) { sh = vh; sw = vh * cR; sx = (vw - sw) / 2; sy = 0; }
+    else         { sw = vw; sh = vw / cR; sx = 0; sy = (vh - sh) / 2; }
+    vidDraw = { sx, sy, sw, sh };
+
+    ctx.save();
+    ctx.translate(width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(vidEl, sx, sy, sw, sh, 0, 0, width, height);
+    ctx.restore();
+  } else {
+    const grd = ctx.createLinearGradient(0, 0, 0, height);
+    grd.addColorStop(0, '#1a1a3e');
+    grd.addColorStop(1, '#0a0a1e');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  if (!hands.length) {
+    updateParticles(ctx);
+    updateFingerHUD([]);
+    return;
+  }
+
+  const sorted = [...hands].sort((a,b) => a.pts[0][0] - b.pts[0][0]);
+  const A = sorted[0];
+  const B = sorted.length > 1 ? sorted[1] : null;
+
+  updateFingerHUD(sorted);
+
+  // ── CYAN MESH (drawn first, so other elements overlay on top) ──
+  if ((mode === 'mesh' || mode === 'both') && B && vidDraw) {
+    drawCyanMesh(A, B, ctx);
+  }
+
+  for (const h of hands) drawHandSkeleton(h, ctx);
+
+  // ── LASER cradle ──
+  if ((mode === 'laser' || mode === 'both') && B) {
+    drawLaserCradle(A, B, ctx);
+  }
+
+  detectTouches();
+  for (const h of hands) drawLandmarks(h, ctx);
+  for (const h of hands) drawFingerLabels(h, ctx);
+  updateParticles(ctx);
+}
+
+// ─────────────────────────────────────────────────────────────
+//   CYAN MESH — 3D membrane between hands with cyanotype filter
+// ─────────────────────────────────────────────────────────────
+function drawCyanMesh(A, B, ctx) {
+  const extA = getExtendedFingers(A.pts);
+  const extB = getExtendedFingers(B.pts);
+  if (extA.length < 1 || extB.length < 1) return;
+
+  // Build fingertip list with z-depth for each hand
+  const tipsA = extA.map(i => ({
+    x: A.pts[FINGERTIPS[i]][0],
+    y: A.pts[FINGERTIPS[i]][1],
+    z: A.z[FINGERTIPS[i]]
+  }));
+  const tipsB = extB.map(i => ({
+    x: B.pts[FINGERTIPS[i]][0],
+    y: B.pts[FINGERTIPS[i]][1],
+    z: B.z[FINGERTIPS[i]]
+  }));
+
+  // Sort each hand's fingertips by y (top to bottom)
+  tipsA.sort((p, q) => p.y - q.y);
+  tipsB.sort((p, q) => p.y - q.y);
+
+  // Triangle strip between two sorted lists
+  const tris = [];
+  let i = 0, j = 0;
+  while (i < tipsA.length - 1 || j < tipsB.length - 1) {
+    if (i < tipsA.length - 1 && (j >= tipsB.length - 1 || tipsA[i + 1].y < tipsB[j + 1].y)) {
+      tris.push([tipsA[i], tipsB[j], tipsA[i + 1]]);
+      i++;
+    } else {
+      tris.push([tipsA[i], tipsB[j], tipsB[j + 1]]);
+      j++;
+    }
+  }
+  // Bonus: add quadrilaterals at each end (closing triangles)
+  // (Optional — strip already gives full coverage between hands)
+
+  // Draw each triangle: clip + cyanotype-filtered video shifted by depth
+  for (const tri of tris) {
+    const avgZ = (tri[0].z + tri[1].z + tri[2].z) / 3;
+    // z is roughly -0.1 (close) to 0.1 (far) in MediaPipe normalized coords
+    // Use it to drive horizontal parallax shift (creates 3D plane feel)
+    const parallaxX = avgZ * 180;   // pixels of shift
+    const parallaxY = Math.sin(t * 1.5 + avgZ * 20) * 8;  // breathing
+
+    ctx.save();
+
+    // Clip to triangle
+    ctx.beginPath();
+    ctx.moveTo(tri[0].x, tri[0].y);
+    ctx.lineTo(tri[1].x, tri[1].y);
+    ctx.lineTo(tri[2].x, tri[2].y);
+    ctx.closePath();
+    ctx.clip();
+
+    // ── Layer 1: Cyanotype-filtered video, shifted for parallax ──
+    ctx.filter = 'sepia(1) hue-rotate(180deg) saturate(3.2) brightness(0.78) contrast(1.4)';
+    ctx.translate(width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(
+      vidEl,
+      vidDraw.sx, vidDraw.sy, vidDraw.sw, vidDraw.sh,
+      -parallaxX, parallaxY, width, height
+    );
+    ctx.filter = 'none';
+
+    // Reset transform for overlay (back to canvas coords)
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    // Re-apply clip after setTransform reset
+    ctx.beginPath();
+    ctx.moveTo(tri[0].x, tri[0].y);
+    ctx.lineTo(tri[1].x, tri[1].y);
+    ctx.lineTo(tri[2].x, tri[2].y);
+    ctx.closePath();
+    ctx.clip();
+
+    // ── Layer 2: Cyan tint overlay (depth-based) ──
+    const tintAlpha = 0.18 + Math.max(0, -avgZ) * 0.6;
+    ctx.fillStyle = `rgba(20, 80, 140, ${tintAlpha})`;
+    ctx.fillRect(0, 0, width, height);
+
+    // ── Layer 3: Stipple noise inside triangle (cyanotype grain) ──
+    const cx = (tri[0].x + tri[1].x + tri[2].x) / 3;
+    const cy = (tri[0].y + tri[1].y + tri[2].y) / 3;
+    const triRadius = Math.max(
+      Math.hypot(tri[0].x - cx, tri[0].y - cy),
+      Math.hypot(tri[1].x - cx, tri[1].y - cy),
+      Math.hypot(tri[2].x - cx, tri[2].y - cy)
+    );
+    const stippleCount = Math.floor(triRadius * 0.4);
+    ctx.fillStyle = 'rgba(180, 220, 255, 0.18)';
+    for (let s = 0; s < stippleCount; s++) {
+      const sx = cx + (Math.random() - 0.5) * triRadius * 2;
+      const sy = cy + (Math.random() - 0.5) * triRadius * 2;
+      ctx.beginPath();
+      ctx.arc(sx, sy, Math.random() * 1.2 + 0.3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.restore();
+
+    // ── Layer 4: Triangle edge glow (drawn outside clip) ──
+    ctx.shadowBlur = 14;
+    ctx.shadowColor = 'rgba(80, 180, 255, 0.9)';
+    ctx.strokeStyle = `rgba(120, 210, 255, ${0.6 + Math.max(0, -avgZ) * 1.5})`;
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    ctx.moveTo(tri[0].x, tri[0].y);
+    ctx.lineTo(tri[1].x, tri[1].y);
+    ctx.lineTo(tri[2].x, tri[2].y);
+    ctx.closePath();
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+
+function isFingerExtended(pts, fingerIdx) {
+  const wrist = pts[0];
+  const tip = pts[FINGERTIPS[fingerIdx]];
+  const pip = pts[FINGER_PIPS[fingerIdx]];
+  if (fingerIdx === 0) {
+    const thumbTip = pts[4], thumbMcp = pts[2], indexMcp = pts[5];
+    return dist(thumbTip[0], thumbTip[1], indexMcp[0], indexMcp[1]) >
+           dist(thumbMcp[0], thumbMcp[1], indexMcp[0], indexMcp[1]) * 1.15;
+  }
+  return dist(tip[0], tip[1], wrist[0], wrist[1]) >
+         dist(pip[0], pip[1], wrist[0], wrist[1]) * 1.05;
+}
+function getExtendedFingers(pts) {
+  const ext = [];
+  for (let i = 0; i < 5; i++) if (isFingerExtended(pts, i)) ext.push(i);
+  return ext;
+}
+function gestureName(extended) {
+  const e = extended.join(',');
+  if (e === '') return 'fist ✊';
+  if (e === '0,1,2,3,4') return 'open ✋';
+  if (e === '1') return 'point ☝';
+  if (e === '1,2') return 'peace ✌';
+  if (e === '0,1,4') return 'rock 🤘';
+  if (e === '0,4') return 'shaka 🤙';
+  if (e === '0,1') return 'gun 🔫';
+  if (e === '1,2,3,4') return 'four';
+  if (e === '0') return 'thumbs ↑';
+  if (e === '1,4') return 'devil';
+  return '';
+}
+function updateFingerHUD(sortedHands) {
+  const left  = sortedHands[0] ? getExtendedFingers(sortedHands[0].pts) : null;
+  const right = sortedHands[1] ? getExtendedFingers(sortedHands[1].pts) : null;
+  const lc = left  ? left.length  : 0;
+  const rc = right ? right.length : 0;
+  document.getElementById('leftCount').textContent  = left  ? lc : '—';
+  document.getElementById('rightCount').textContent = right ? rc : '—';
+  document.getElementById('totalCount').textContent = (left||right) ? (lc + rc) : '—';
+  document.getElementById('leftGest').textContent   = left  ? gestureName(left)  : '';
+  document.getElementById('rightGest').textContent  = right ? gestureName(right) : '';
+}
+
+function drawHandSkeleton(hand, ctx) {
+  ctx.shadowBlur = 16;
+  ctx.shadowColor = 'rgba(0, 255, 255, 1)';
+  ctx.strokeStyle = mode === 'mesh' ? 'rgba(150, 220, 255, 0.85)' : 'rgba(0, 240, 255, 0.95)';
+  ctx.lineWidth = 2.2;
+  ctx.lineCap = 'round';
+  for (const [a, b] of HAND_CONNECTIONS) {
+    ctx.beginPath();
+    ctx.moveTo(hand.pts[a][0], hand.pts[a][1]);
+    ctx.lineTo(hand.pts[b][0], hand.pts[b][1]);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+}
+
+function drawLandmarks(hand, ctx) {
+  const extended = getExtendedFingers(hand.pts);
+  for (let i = 0; i < ALL_LANDMARKS; i++) {
+    const [x, y] = hand.pts[i];
+    const tipIdx = FINGERTIPS.indexOf(i);
+    const isTip = tipIdx !== -1;
+    const isExtTip = isTip && extended.includes(tipIdx);
+    const isKnuckle = (i === 0 || i === 5 || i === 9 || i === 13 || i === 17);
+
+    if (isExtTip) {
+      const tipColor = mode === 'mesh' ? 'rgba(100, 200, 255, 1)' : 'rgba(255, 80, 220, 1)';
+      const tipGlow  = mode === 'mesh' ? 'rgba(50, 150, 255, 1)'  : 'rgba(255, 0, 200, 1)';
+      ctx.shadowBlur = 36;
+      ctx.shadowColor = tipGlow;
+      ctx.fillStyle = tipColor;
+      ctx.beginPath(); ctx.arc(x, y, 8, 0, Math.PI*2); ctx.fill();
+      ctx.shadowBlur = 14;
+      ctx.shadowColor = 'rgba(255, 255, 255, 1)';
+      ctx.fillStyle = 'rgba(255, 255, 255, 1)';
+      ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI*2); ctx.fill();
+    } else if (isTip) {
+      ctx.shadowBlur = 12;
+      ctx.shadowColor = 'rgba(100, 100, 150, 0.7)';
+      ctx.fillStyle = 'rgba(180, 180, 220, 0.7)';
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI*2); ctx.fill();
+    } else if (isKnuckle) {
+      ctx.shadowBlur = 14;
+      ctx.shadowColor = 'rgba(255, 220, 0, 1)';
+      ctx.fillStyle = 'rgba(255, 235, 80, 1)';
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI*2); ctx.fill();
+    } else {
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = 'rgba(0, 255, 255, 0.9)';
+      ctx.fillStyle = 'rgba(80, 240, 255, 1)';
+      ctx.beginPath(); ctx.arc(x, y, 2.8, 0, Math.PI*2); ctx.fill();
+    }
+  }
+  ctx.shadowBlur = 0;
+}
+
+function drawFingerLabels(hand, ctx) {
+  const extended = getExtendedFingers(hand.pts);
+  ctx.shadowBlur = 8;
+  ctx.shadowColor = 'rgba(0, 0, 0, 1)';
+  ctx.font = 'bold 12px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  for (const fi of extended) {
+    const [x, y] = hand.pts[FINGERTIPS[fi]];
+    ctx.fillStyle = mode === 'mesh' ? 'rgba(150, 220, 255, 1)' : 'rgba(255, 235, 80, 1)';
+    ctx.fillText(FINGER_NAMES[fi].toUpperCase(), x, y - 18);
+  }
+  ctx.shadowBlur = 0;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawLaserCradle(A, B, ctx) {
+  const extA = getExtendedFingers(A.pts);
+  const extB = getExtendedFingers(B.pts);
+  if (!extA.length || !extB.length) return;
+  let avgDist = 0, n = 0;
+  for (const ai of extA) for (const bi of extB) {
+    avgDist += dist(A.pts[FINGERTIPS[ai]][0], A.pts[FINGERTIPS[ai]][1],
+                    B.pts[FINGERTIPS[bi]][0], B.pts[FINGERTIPS[bi]][1]);
+    n++;
+  }
+  avgDist /= Math.max(n, 1);
+  const norm = constrain(map(avgDist, 80, Math.min(width, height) * 0.7, 0, 1), 0, 1);
+  const baseThickness = lerp(2.4, 0.8, norm);
+  let idx = 0;
+  for (const ai of extA) {
+    for (const bi of extB) {
+      const [ax, ay] = A.pts[FINGERTIPS[ai]];
+      const [bx, by] = B.pts[FINGERTIPS[bi]];
+      const hueShift = (idx * 17 + t * 22) % 360;
+      const {r, g, b} = hueToCMY(hueShift, norm);
+      const shimmer = Math.sin(t * 8 + idx * 0.9) * 1.5;
+      const mx = (ax + bx) / 2 + shimmer;
+      const my = (ay + by) / 2 + shimmer * 0.6;
+
+      ctx.shadowBlur = 38;
+      ctx.shadowColor = `rgba(${r},${g},${b},0.95)`;
+      ctx.strokeStyle = `rgba(${r},${g},${b},0.14)`;
+      ctx.lineWidth = baseThickness * 5;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(ax, ay); ctx.quadraticCurveTo(mx, my, bx, by); ctx.stroke();
+
+      ctx.shadowBlur = 22;
+      ctx.strokeStyle = `rgba(${r},${g},${b},0.45)`;
+      ctx.lineWidth = baseThickness * 2.2;
+      ctx.beginPath();
+      ctx.moveTo(ax, ay); ctx.quadraticCurveTo(mx, my, bx, by); ctx.stroke();
+
+      ctx.shadowBlur = 14;
+      ctx.shadowColor = `rgba(255,255,255,1)`;
+      ctx.strokeStyle = `rgba(255,255,255,0.95)`;
+      ctx.lineWidth = baseThickness * 0.6;
+      ctx.beginPath();
+      ctx.moveTo(ax, ay); ctx.quadraticCurveTo(mx, my, bx, by); ctx.stroke();
+      idx++;
+    }
+  }
+  ctx.shadowBlur = 0;
+}
+
+function detectTouches() {
+  if (hands.length < 2) { prevTouchPairs = new Set(); return; }
+  const sorted = [...hands].sort((a,b) => a.pts[0][0] - b.pts[0][0]);
+  const A = sorted[0], B = sorted[1];
+  const extA = getExtendedFingers(A.pts);
+  const extB = getExtendedFingers(B.pts);
+  const TOUCH_RADIUS = 40;
+  const current = new Set();
+  for (const ai of extA) {
+    for (const bi of extB) {
+      const [ax, ay] = A.pts[FINGERTIPS[ai]];
+      const [bx, by] = B.pts[FINGERTIPS[bi]];
+      const d = dist(ax, ay, bx, by);
+      if (d < TOUCH_RADIUS) {
+        const key = `${ai}-${bi}`;
+        current.add(key);
+        if (!prevTouchPairs.has(key)) explode((ax + bx) / 2, (ay + by) / 2, ai, bi);
+      }
+    }
+  }
+  prevTouchPairs = current;
+}
+
+function explode(x, y, ai, bi) {
+  for (let i = 0; i < 36; i++) {
+    const ang = (Math.PI * 2 * i) / 36 + Math.random() * 0.3;
+    const sp = 3 + Math.random() * 6;
+    const {r, g, b} = hueToCMY((ai * 5 + bi) * 17 + t * 22, 0.3);
+    particles.push({x,y,vx:Math.cos(ang)*sp,vy:Math.sin(ang)*sp,life:1.0,decay:0.018+Math.random()*0.012,r,g,b,sz:1.6+Math.random()*2.6});
+  }
+  for (let i = 0; i < 14; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    const sp = 1 + Math.random() * 3;
+    particles.push({x,y,vx:Math.cos(ang)*sp,vy:Math.sin(ang)*sp,life:1.0,decay:0.03+Math.random()*0.02,r:255,g:255,b:255,sz:1.8+Math.random()*1.5});
+  }
+}
+
+function updateParticles(ctx) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.vx *= 0.94; p.vy *= 0.94;
+    p.vy += 0.08;
+    p.life -= p.decay;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    ctx.shadowBlur = 20;
+    ctx.shadowColor = `rgba(${p.r},${p.g},${p.b},${p.life})`;
+    ctx.fillStyle = `rgba(${p.r},${p.g},${p.b},${p.life})`;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.sz * p.life, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+}
+
+function hueToCMY(hue, stretch) {
+  const h = (hue % 360 + 360) % 360;
+  let r, g, b;
+  if (h < 120) { const f = h/120; r=lerp(0,255,f); g=lerp(255,0,f); b=255; }
+  else if (h < 240) { const f=(h-120)/120; r=255; g=lerp(0,255,f); b=lerp(255,0,f); }
+  else { const f=(h-240)/120; r=255; g=lerp(255,0,f); b=lerp(0,255,f); }
+  const sb = stretch*0.4;
+  return {r:Math.round(lerp(r,255,sb)),g:Math.round(lerp(g,200,sb*0.3)),b:Math.round(lerp(b,255,sb*0.2))};
+}
+
+async function initMediaPipe() {
+  vidEl = document.getElementById('vid');
+  const handsModel = new Hands({
+    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${f}`
+  });
+  handsModel.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.5
+  });
+
+  handsModel.onResults(res => {
+    if (!modelReady) {
+      modelReady = true;
+      document.getElementById('hint').innerHTML = '◇ tunjukkan dua tangan ◇<br><small>coba toggle mode di bawah</small>';
+    }
+    if (res.multiHandLandmarks && res.multiHandLandmarks.length) {
+      if (!handsEverSeen) {
+        handsEverSeen = true;
+        document.getElementById('hint').style.opacity = '0';
+      }
+      hands = res.multiHandLandmarks.map((lms) => ({
+        pts: lms.map(lm => [(1 - lm.x) * width, lm.y * height]),
+        z: lms.map(lm => lm.z)   // depth for 3D mesh
+      }));
+      document.getElementById('status').textContent = `hands: ${hands.length}  ·  fps: ${Math.round(frameRate())}  ·  mode: ${mode}`;
+    } else {
+      hands = [];
+      document.getElementById('status').textContent = `hands: 0  ·  mode: ${mode}`;
+    }
+  });
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, facingMode: 'user' }
+    });
+    vidEl.srcObject = stream;
+    await vidEl.play();
+    document.getElementById('status').textContent = 'loading model…';
+
+    const cam = new Camera(vidEl, {
+      onFrame: async () => { await handsModel.send({ image: vidEl }); },
+      width: 1280, height: 720
+    });
+    cam.start();
+  } catch (e) {
+    document.getElementById('hint').innerHTML = '⚠ camera access denied<br><small>allow permission & refresh</small>';
+    document.getElementById('status').textContent = 'error: ' + e.message;
+  }
+}
+</script>
+</body>
+</html>
